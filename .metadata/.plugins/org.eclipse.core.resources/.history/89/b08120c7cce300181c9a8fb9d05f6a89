@@ -1,0 +1,990 @@
+#include <string.h>
+#include "util.h"
+#include "icall_ble_api.h"
+#include "osal_snv.h"
+#include "security_digital_key.h"
+#include "ingeek_ble_profile.h"
+#include "DigitalKey.pb.h"
+#include "pb_encode.h"
+#include "pb_decode.h"
+#include "aes.h"
+#include "cmac.h"
+#include "md_export.h"
+#include "inc/sdi_task.h"
+#include "inc/sdi_tl_uart.h"
+#include "ingeek_ble_server.h"
+
+uint8_t qian_rssi,hou_rssi,zuo_rssi,you_rssi;
+Ingeek_StateM_t statem;
+INFO_DATA info_t;
+extern bool ifLOG;
+extern Clock_Struct periodicClock;
+extern bool xiaochengxu;
+extern uint8_t Data_send[128];
+extern uint8_t shang;
+extern uint8_t yu;
+extern bool DoorState;
+extern bool AutoLOCK;
+extern bool AutoUnlOCK;
+extern uint8_t rssi;
+static int PBEncode_Characteristic_Data(void* buffer,uint32_t length,void*pb_struct,const pb_field_t fields[])
+{
+    bool status;
+
+    pb_ostream_t stream = pb_ostream_from_buffer(buffer, length);
+    status = pb_encode(&stream, fields, pb_struct);
+    if(!status){
+        //DEBUG( PB_GET_ERROR(&stream));
+        return FAILURE;
+    }
+
+    return (stream.bytes_written);
+}
+
+
+static int PBDecode_Characteristic_Data(void* srcdata,uint32_t datalength,void*pb_struct,const pb_field_t fields[])
+{
+    bool status;
+
+    pb_istream_t stream = pb_istream_from_buffer(srcdata, datalength);
+    status = pb_decode(&stream, fields, pb_struct);
+    if(!status){
+        //DEBUG(PB_GET_ERROR(&stream));
+        return FAILURE;
+    }
+
+    return SUCCESS;
+}
+
+static int Get_TRNG(uint8_t *random, int randsize, int flag)
+{
+    int ret=0;
+    uint32_t trng=0;
+
+    uint8_t mdout[LENGTH_32]={0};
+
+    const mbedtls_md_info_t *md_info=NULL;
+    md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if( md_info == NULL ){
+        return INGEEK_ERR_MD_INFO_TYPE;
+    }
+
+    trng=Util_GetTRNG();
+
+    ret= mbedtls_md(md_info,(void*)&trng,sizeof(uint32_t),mdout);
+    if(ret != 0){
+        return INGEEK_ERR_SHA256;
+    }
+#if(0)
+    uint8_t rand_data[LENGTH_32]={0xB1,0xB1,0xB3,0xB4,0xB5,0xB6,0xB7,0xB8,0xB9,0xBF,0xB1,0xB1,0xB3,0xB4,0xB5,0xB6,0xB7,0xB8,0xB9,0xBF,0xB1,0xB1,0xB3,0xB4,0xB5,0xB6,0xB7,0xB8,0xB9,0xBF,0xB1,0xB1};
+    memcpy(mdout,rand_data,LENGTH_32);
+#endif
+    if(flag == 0 && randsize == LENGTH_8){
+        memcpy(random,mdout,LENGTH_8); /*for TRND*/
+    }
+    else if(flag == 1 && randsize == LENGTH_32){
+        memcpy(random,mdout,LENGTH_32); /*for KIFD*/
+    }
+    else
+      return FAILURE;
+
+    return SUCCESS;
+}
+
+
+static int Handle_read_Infochar(void)
+{
+    size_t message_length;
+    uint8_t buffer[LENGTH_32]={0};
+    ingeek_DK_InfoR info_message=ingeek_DK_InfoR_init_default;
+
+    info_message.TRnd.size=LENGTH_8;
+#ifndef BLE_SCANNER_DEBUG
+    if(SUCCESS != Get_TRNG(info_message.TRnd.bytes, LENGTH_8, 0)){/*get TRnd*/
+        return INGEEK_ERR_TRND;
+    }
+#else
+    memcpy(info_message.TRnd.bytes, "12345678", LENGTH_8); //跟vs端生成的数据一致
+#endif
+    memcpy(info_message.VIN,statem.vin,VIN_LEN);
+
+    message_length=PBEncode_Characteristic_Data(buffer,sizeof(buffer),&info_message,ingeek_DK_InfoR_fields);
+    if(message_length == FAILURE || message_length > LENGTH_32 ){
+        return INGEEK_ERR_PBENCODE;
+    }
+
+    info_t.infolen=message_length;
+    memcpy(info_t.info_data,buffer,message_length);
+
+    memcpy(statem.auth_g.TRnd,info_message.TRnd.bytes,LENGTH_8);//set TRnd
+    return SUCCESS;
+}
+
+static int Handle_write_Infochar(uint8_t *data,uint32_t len)
+{
+    uint8 ret1=0,ret2=0;
+    uint32_t keylen=0;
+    uint8_t key[LENGTH_16]={0};
+
+    ingeek_DK_InfoW info_message=ingeek_DK_InfoW_init_zero;
+    ret1=PBDecode_Characteristic_Data(data,len,&info_message,ingeek_DK_InfoW_fields);
+    if(ret1 != SUCCESS || (info_message.CMPK.size) != LENGTH_48){
+        return INGEEK_ERR_PBDECODE;
+    }
+    else{
+        memset(statem.vin,0x00,sizeof(statem.vin));
+        memcpy(statem.vin,info_message.VIN,VIN_LEN);
+
+        ret1=osal_snv_write(KEY_SNV_ID,info_message.CMPK.size,info_message.CMPK.bytes);
+        ret2=osal_snv_write(CAR_INFO_ID,VIN_LEN, info_message.VIN);
+        if(ret1 != SUCCESS || ret2 != SUCCESS){
+            return INGEEK_ERR_SNV_WRITE;
+        }
+    }
+
+    memcpy(key,info_message.VIN,LENGTH_16);/*Front 16 bytes of vin as key*/
+    memset(statem.Keyinfo.SSC,0x00,LENGTH_16); /*iv 0x00*/
+    ret1=AES_CBC_128_cipher(key,statem.Keyinfo.SSC,info_message.CMPK.bytes, info_message.CMPK.size, statem.Keyinfo.CMPK, &keylen, DECRYPT);
+    if(ret1 != SUCCESS || keylen != LENGTH_32){
+        return INGEEK_ERR_AES_DECRYPT;
+    }
+
+    return SUCCESS;
+}
+
+
+ int Send_cmd_result(int32_t cmd,int32_t result,uint8_t paramID)
+{
+    int ret=0;
+    size_t message_length;
+    uint8_t buffer[LENGTH_32]={0};
+    ingeek_DK_Cmd cmd_message=ingeek_DK_Cmd_init_zero;
+
+    cmd_message.command=cmd;
+    cmd_message.result=result;
+    ret=PBEncode_Characteristic_Data(buffer,sizeof(buffer),&cmd_message,ingeek_DK_Cmd_fields);
+    if(ret == FAILURE || ret > LENGTH_32){
+        return INGEEK_ERR_PBENCODE;
+    }
+
+    message_length = ret;
+    uint32_t PlaintextLen=0;
+    uint8_t Plaintext[LENGTH_32]={0};
+    ret=AES_CBC_128_cipher(statem.Keyinfo.SK,statem.Keyinfo.SSC,buffer,message_length,Plaintext,&PlaintextLen,ENCRYPT);
+    if(ret != SUCCESS){
+        return INGEEK_ERR_AES_ENCRYPT;
+    }
+
+    Characteristic_zeroize(paramID);/*clear chars*/
+    //DEBUG(Plaintext);
+    if(true == ifLOG){
+        DEBUG("PlaintextLen: "); DEBUG((uint8_t*)convInt32ToText((int)PlaintextLen)); DEBUG_NEWLINE();
+    }
+    if(xiaochengxu == false){
+    DigitalkeyService_SetParameter(paramID, Plaintext, PlaintextLen);
+    }else{
+        memset(Data_send, 0, 128);
+        memcpy(Data_send ,Plaintext ,PlaintextLen);
+        shang = PlaintextLen/19;
+        yu = PlaintextLen%19;
+        Util_startClock(&periodicClock);
+    }
+    return SUCCESS;
+}
+
+
+static int Handle_Character_Cmd(uint8_t paramID,uint8_t *data,uint8 len,int32_t *cmd)
+{
+    int ret=0;
+    uint32_t PlaintextLen=0;
+    uint8_t* Plaintext=(uint8_t*)ICall_malloc(len);
+    if(Plaintext == NULL){
+        return INGEEK_ERR_MALLOC;
+    }
+
+    ret=AES_CBC_128_cipher(statem.Keyinfo.SK,statem.Keyinfo.SSC,data, len, Plaintext, &PlaintextLen, DECRYPT);
+    if(ret != SUCCESS){
+        if(Plaintext){
+            ICall_free(Plaintext);
+        }
+        return INGEEK_ERR_AES_DECRYPT;
+    }
+    //DEBUG(Plaintext);DEBUG_NEWLINE();
+    ingeek_DK_Cmd cmd_message=ingeek_DK_Cmd_init_zero;
+    ret=PBDecode_Characteristic_Data(Plaintext,PlaintextLen,&cmd_message,ingeek_DK_Cmd_fields);
+    if(ret != SUCCESS){
+        if(Plaintext){
+            ICall_free(Plaintext);
+        }
+        return INGEEK_ERR_PBDECODE;
+    }
+
+    if(Plaintext){
+        ICall_free(Plaintext);
+    }
+
+    *cmd=(cmd_message.command);
+    return (cmd_message.result);
+}
+
+
+static int Handle_Character_Auth_X(uint8_t *data,uint32_t len)
+{
+    uint8_t* Plaintext=(uint8_t*)ICall_malloc(len);
+    if(Plaintext == NULL){
+        return INGEEK_ERR_MALLOC;
+    }
+
+    int ret=0;
+    uint32_t PlaintextLen=0;
+    uint8_t key[LENGTH_16]={0};
+
+    memcpy(key,statem.Keyinfo.CMPK,LENGTH_16);/*Front 16 bytes of CMPK as key*/
+    memset(statem.Keyinfo.SSC,0x00,LENGTH_16);/*iv 0x00*/
+    ret=AES_CBC_128_cipher(key,statem.Keyinfo.SSC,data,len,Plaintext,&PlaintextLen,DECRYPT);
+    if(ret != SUCCESS){
+        if(Plaintext){
+            ICall_free(Plaintext);
+        }
+        return INGEEK_ERR_AES_DECRYPT;
+    }
+
+    ingeek_DK_AuthX auth_message=ingeek_DK_AuthX_init_zero;
+    ret=PBDecode_Characteristic_Data(Plaintext,PlaintextLen,&auth_message,ingeek_DK_AuthX_fields);
+    if(ret !=SUCCESS || (auth_message.keys.cipher.size)!= LENGTH_16){
+        if(Plaintext){
+            ICall_free(Plaintext);
+        }
+        return INGEEK_ERR_PBDECODE;
+    }
+
+    memset(statem.Keyinfo.SK, 0x00, LENGTH_16);
+    memcpy(statem.Keyinfo.SK, auth_message.keys.cipher.bytes, LENGTH_16);
+    statem.auth_x.auth_data = auth_message.auth_data;
+    statem.auth_x.auth_time = auth_message.authtime.seconds;
+    statem.end_time = auth_message.endtime.seconds;
+    memcpy(statem.auth_x.cname, auth_message.cname, sizeof(auth_message.cname));
+    memcpy(statem.auth_x.cream, auth_message.crealm, sizeof(auth_message.crealm));
+
+    if(Plaintext){
+        ICall_free(Plaintext);
+    }
+
+    return SUCCESS;
+}
+
+
+static int Verify_session_parameter_X(ingeek_DK_SessionX* session_message)
+{
+    if(memcmp(statem.auth_x.cname, session_message->cname,strlen(statem.auth_x.cname)) != 0){
+        return INGEEK_ERR_CNAME;
+    }
+    else if(memcmp(statem.auth_x.cream, session_message->crealm,strlen(statem.auth_x.cream))!=0){
+        return INGEEK_ERR_CREAM;
+    }
+    else if(statem.auth_x.auth_data != session_message->auth_data){
+        return INGEEK_ERR_AUTH;
+    }
+    else if((session_message->ctime.seconds <= statem.auth_x.auth_time) || (session_message->ctime.seconds >=statem.end_time)){
+        return INGEEK_ERR_CTIME;
+    }
+
+    return SUCCESS;
+}
+
+static int Handle_Character_Session_X(uint8_t *data,uint32_t len)
+{
+    int ret=0;
+    uint32_t PlaintextLen=0;
+    uint8_t* Plaintext=(uint8_t*)ICall_malloc(len);
+    if(Plaintext == NULL){
+        return INGEEK_ERR_MALLOC;
+    }
+
+    memset(statem.Keyinfo.SSC,0x00,LENGTH_16);/*iv 0x00*/
+    /*statem.Keyinfo.SK as key*/
+    ret=AES_CBC_128_cipher(statem.Keyinfo.SK,statem.Keyinfo.SSC,data, len, Plaintext, &PlaintextLen, DECRYPT);
+    if(ret != SUCCESS){
+        if(Plaintext){
+            ICall_free(Plaintext);
+        }
+        return INGEEK_ERR_AES_DECRYPT;
+    }
+
+    ingeek_DK_SessionX session_message=ingeek_DK_SessionX_init_zero;
+    ret=PBDecode_Characteristic_Data(Plaintext,PlaintextLen,&session_message,ingeek_DK_SessionX_fields);
+    if(ret != SUCCESS || (session_message.seq_number.size) != LENGTH_16){
+        if(Plaintext){
+            ICall_free(Plaintext);
+        }
+        return INGEEK_ERR_PBDECODE;
+    }
+    memcpy(statem.Keyinfo.SSC, session_message.seq_number.bytes, session_message.seq_number.size);
+    if(Plaintext){
+        ICall_free(Plaintext);
+    }
+
+    ret=Verify_session_parameter_X(&session_message);
+    if(ret != SUCCESS){
+        return INGEEK_ERR_VERIFY_SESSION;
+    }
+
+    return SUCCESS;
+}
+
+
+static int Handle_Character_Auth_G(uint8_t *data,uint32_t len)
+{
+    int ret=0;
+
+    ingeek_DK_AuthG auth_message_g=ingeek_DK_AuthG_init_zero;
+    ret=PBDecode_Characteristic_Data(data,len,&auth_message_g,ingeek_DK_AuthG_fields);
+    if(ret != SUCCESS || auth_message_g.df.size != LENGTH_32 || auth_message_g.s_cmac.size != LENGTH_16){
+        return INGEEK_ERR_PBDECODE;
+    }
+
+    memcpy(statem.auth_g.Info_md,auth_message_g.df.bytes,auth_message_g.df.size);
+    memcpy(statem.auth_g.s_cmac,auth_message_g.s_cmac.bytes,auth_message_g.s_cmac.size);
+
+    memset(statem.auth_g.SEID,0x01,LENGTH_16);//init SEID
+    return SUCCESS;
+}
+
+static int Calculate_VCK(void)
+{
+    int ret=0;
+    uint8_t hmacout[LENGTH_32]={0};
+
+    const mbedtls_md_info_t *md_info=NULL;
+    md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if( md_info == NULL ){
+        return INGEEK_ERR_MD_INFO_TYPE;
+    }
+
+    uint8_t DF[LENGTH_16]={0};
+    memcpy(DF,statem.auth_g.Info_md,LENGTH_16);
+
+    ret=mbedtls_md_hmac(md_info,statem.Keyinfo.CMPK,LENGTH_32,DF,sizeof(DF),hmacout);
+    if(ret != 0){
+        return INGEEK_ERR_MD_HMAC;
+    }
+
+    memcpy(statem.Keyinfo.VCK,hmacout,LENGTH_16);
+    return SUCCESS;
+}
+
+static int Calculate_SK(void *KICC,int KICClen)
+{
+    int ret=0;
+    uint8_t mdout[LENGTH_32]={0};
+
+    const mbedtls_md_info_t *md_info=NULL;
+    md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if( md_info == NULL ){
+        return INGEEK_ERR_MD_INFO_TYPE;
+    }
+
+    uint8_t mdinput[68]={0};
+    uint8_t tail[4]={0x00,0x00,0x00,0x01};
+    memcpy(mdinput,statem.auth_g.KIFD,sizeof(statem.auth_g.KIFD));
+    memcpy(mdinput+sizeof(statem.auth_g.KIFD),KICC,KICClen);
+    memcpy(mdinput+sizeof(statem.auth_g.KIFD)+KICClen,tail,sizeof(tail));
+    ret= mbedtls_md(md_info,mdinput,sizeof(mdinput),mdout);
+    if(ret != 0){
+        return INGEEK_ERR_SHA256;
+    }
+    /*SK:KIFD||KICC||00 00 00 01*/
+    memcpy(statem.Keyinfo.SK,mdout,LENGTH_16);
+    return SUCCESS;
+}
+
+
+int Verify_session_G(ingeek_DK_SessionG *session_message_g)
+{
+    if(0 != (memcmp(session_message_g->SEID.bytes,statem.auth_g.SEID,session_message_g->SEID.size))){
+        return INGEEK_ERR_SEID;
+    }
+
+    if(0 != (memcmp(session_message_g->TRnd.bytes,statem.auth_g.TRnd,session_message_g->TRnd.size))){
+        return INGEEK_ERR_TRND;
+    }
+
+    /*
+    if(session_message_g->ENDTIME.seconds > statem.endtime){
+        return -3;
+    }
+    */
+
+    return SUCCESS;
+}
+
+
+static int Handle_Character_Session_G(ingeek_DK_SessionG *session_message_g,uint8_t *data,uint32_t len)
+{
+    int ret=0;
+
+    ret=Calculate_VCK();
+    if(ret != SUCCESS){
+        return INGEEK_ERR_CALCULATE_VCK;
+    }
+
+    uint32_t PlaintextLen=0;
+    uint8_t* Plaintext=(uint8_t*)ICall_malloc(len);
+    if(Plaintext == NULL){
+        return INGEEK_ERR_MALLOC;
+    }
+
+    memset(statem.Keyinfo.SSC,0x00,LENGTH_16);
+    ret=AES_CBC_128_cipher(statem.Keyinfo.VCK,statem.Keyinfo.SSC,data,len,Plaintext,&PlaintextLen, DECRYPT);
+    if(ret != SUCCESS){
+        if(Plaintext){
+            ICall_free(Plaintext);
+        }
+        return INGEEK_ERR_AES_DECRYPT;
+    }
+
+    /*PlaintextLen  remove padding len*/
+    ret=ingeek_AesCmacVerify(statem.auth_g.s_cmac,LENGTH_16,Plaintext,PlaintextLen,statem.Keyinfo.VCK, LENGTH_16);
+    if(ret != 0){
+        if(Plaintext){
+            ICall_free(Plaintext);
+        }
+        return INGEEK_ERR_AESCMAC_VERIFY;
+    }
+
+    ret=PBDecode_Characteristic_Data(Plaintext,PlaintextLen,session_message_g,ingeek_DK_SessionG_fields);
+    if(ret != SUCCESS || session_message_g->CRnD.size != LENGTH_8 || session_message_g->SEID.size != LENGTH_16){
+        if(Plaintext){
+            ICall_free(Plaintext);
+        }
+        return INGEEK_ERR_PBDECODE;
+    }
+    else{
+        if(Plaintext){
+            ICall_free(Plaintext);
+        }
+    }
+
+    ret=Verify_session_G(session_message_g);
+    if(ret != SUCCESS){
+        return ret;
+    }
+
+    statem.auth_g.KPRE=session_message_g->KPRE;
+#ifndef BLE_SCANNER_DEBUG
+    if(SUCCESS != Get_TRNG(statem.auth_g.KIFD, LENGTH_32, 1)){/*get KIFD*/
+        return INGEEK_ERR_TRND;
+    }
+#else
+    memset(statem.auth_g.KIFD, 0xC4, LENGTH_32);
+#endif
+
+    return SUCCESS;
+}
+
+static int Send_data_SS(uint8_t paramID,ingeek_DK_SessionG *session_message)
+{
+    int ret=0;
+    size_t message_length;
+    //uint8_t buffer[128]={0};
+    static uint8_t buffer[128] = {0};
+
+    ingeek_DK_SessionG message_g = ingeek_DK_SessionG_init_zero;
+    message_g.avno=session_message->avno;
+    message_g.TRnd.size = LENGTH_8;
+    memcpy(message_g.TRnd.bytes,statem.auth_g.TRnd,LENGTH_8);
+
+    message_g.CRnD.size = LENGTH_8;
+    memcpy(message_g.CRnD.bytes,session_message->CRnD.bytes,LENGTH_8);
+
+    message_g.SEID.size = LENGTH_16;
+    memcpy(message_g.SEID.bytes,statem.auth_g.SEID,LENGTH_16);
+
+    message_g.TEEID.size = LENGTH_16;
+    memcpy(message_g.TEEID.bytes,session_message->TEEID.bytes,LENGTH_16);
+
+    message_g.has_KIFD=true;
+    message_g.KIFD.size = LENGTH_32;
+    memcpy(message_g.KIFD.bytes,statem.auth_g.KIFD,LENGTH_32);
+
+    message_g.KPRE=true;
+    message_g.KPRE=session_message->KPRE;
+    message_g.has_ENDTIME=true;
+    message_g.ENDTIME.seconds=session_message->has_ENDTIME;
+
+    ret=PBEncode_Characteristic_Data(buffer,sizeof(buffer),&message_g,ingeek_DK_SessionG_fields);
+    if(true == ifLOG){
+        DEBUG("message_length:"); DEBUG((uint8_t*)convInt32ToText((int)ret));DEBUG_NEWLINE();
+    }
+    if(ret == FAILURE || ret > 128){
+        return INGEEK_ERR_PBENCODE;
+    }
+
+    message_length = ret;
+    uint32_t PlaintextLen=0;
+    uint8_t Plaintext[160]={0};//160byte
+    memset(statem.Keyinfo.SSC,0x00,LENGTH_16);
+    ret=AES_CBC_128_cipher(statem.Keyinfo.VCK,statem.Keyinfo.SSC,buffer,message_length, Plaintext, &PlaintextLen, ENCRYPT);
+    if(ret != SUCCESS){
+        return INGEEK_ERR_AES_ENCRYPT;
+    }
+    if(true == ifLOG){
+        DEBUG("PlaintextLen_SS: "); DEBUG((uint8_t*)convInt32ToText((int)PlaintextLen)); DEBUG_NEWLINE();
+    }
+    Characteristic_zeroize(paramID);/*clear chars*/
+
+    if(xiaochengxu == false){
+    DigitalkeyService_SetParameter(paramID, Plaintext, PlaintextLen);
+    }else{
+        memset(Data_send, 0, 128);
+        memcpy(Data_send ,Plaintext ,PlaintextLen);
+        shang = PlaintextLen/19;
+        yu = PlaintextLen%19;
+        Util_startClock(&periodicClock);
+    }
+
+
+    return SUCCESS;
+}
+
+
+void Check_Carinfo(void)
+{
+   uint8 ret=0;
+   uint32_t keylen=0;
+   uint8_t key[LENGTH_16]={0};
+   uint8_t Cmpk_cipher[LENGTH_48]={0};
+
+   memset(&statem,0x00,sizeof(Ingeek_StateM_t));
+   //preset version data here
+   const char* version_num = "DK1.2.0.B";
+   memcpy(statem.version, version_num, strlen(version_num));
+   statem.ver_number = 1;
+
+   ret=osal_snv_read(CAR_INFO_ID, VIN_LEN, statem.vin);
+   if(ret != SUCCESS){
+       statem.status=CARINFO_INVALID;
+   }
+   else{
+       ret=osal_snv_read(KEY_SNV_ID, LENGTH_48, Cmpk_cipher);
+       if(ret != SUCCESS){
+           statem.status=CARINFO_INVALID;
+       }
+       else{
+           memcpy(key,statem.vin,LENGTH_16);/*key*/
+           memset(statem.Keyinfo.SSC,0x00,LENGTH_16);/*iv*/
+           ret=AES_CBC_128_cipher(key,statem.Keyinfo.SSC,Cmpk_cipher, LENGTH_48, statem.Keyinfo.CMPK, &keylen, DECRYPT);
+           if(ret != SUCCESS || keylen != LENGTH_32){
+               statem.status=CARINFO_INVALID;
+
+               memset(&statem,0x00,sizeof(Ingeek_StateM_t));/*reset Ingeek_StateM_t struct*/
+           }
+           else{
+               if(true == ifLOG){
+                   DEBUG("status"); DEBUG((uint8_t*)convInt32ToText((int)statem.status)); DEBUG_NEWLINE();
+               }
+               statem.status=CARINFO_VALID;
+           }
+       }
+   }
+
+   if(statem.status == CARINFO_VALID){/*set info data*/
+       info_t.flag=Handle_read_Infochar();
+   }
+
+   DigitalkeyService_SetParameter(DKSERVER_CHAR_STATUS,&(statem.status),sizeof(uint8_t));
+}
+
+
+static int Handle_Character_Ver(uint8_t paramID, uint8_t *data,uint8 len)
+{
+    //if version exist just modify the last character or write the full string
+    if(data[0] == '\0' || len == 0)
+    {
+        return INGEEK_ERR_VERSION;
+    }
+
+    if(strlen(statem.version)==0)
+    {
+        memset(statem.version, 0, strlen(statem.version));
+        memcpy(statem.version,data, strlen(statem.version));
+    }
+    else
+    {
+        //DEBUG("run at here..\n\r");
+        //DEBUG(&data[0]);
+        statem.version[strlen(statem.version)-1] = data[0];
+    }
+
+    if(strstr(statem.version,"A"))
+    {
+        statem.ver_number = 0;
+    }
+    else
+    {
+        statem.ver_number = 1;
+    }
+
+    return SUCCESS;
+}
+
+typedef struct
+{
+    uint8_t head;
+    uint8_t addr;
+    uint16_t opcode;
+    uint16_t uuid;
+    uint8_t length;
+    uint8_t data[72];
+    uint16_t fcs;
+}__attribute__((packed)) info_send_t;
+
+typedef struct
+{
+  uint8_t head;
+  uint8_t addr;
+  uint16_t opcode;
+  uint16_t uuid;
+  uint8_t length;
+  uint8_t data[55];
+  uint16_t fcs;
+}__attribute__((packed)) auth_send_t;
+
+typedef struct
+{
+  uint8_t head;
+  uint8_t addr;
+  uint16_t opcode;
+  uint16_t uuid;
+  uint8_t length;
+  uint8_t data[112];
+  uint16_t fcs;
+}__attribute__((packed)) session_send_t;
+
+typedef struct
+{
+  uint8_t head;
+  uint8_t addr;
+  uint16_t opcode;
+  uint16_t uuid;
+  uint8_t length;
+  uint8_t data[16];
+  uint16_t fcs;
+}__attribute__((packed)) cmd_send_t;
+
+
+void Handle_Character(uint8_t paramID, uint8_t *newValue,uint32_t returnBytes)
+{
+    int ret=0;
+    int32_t cmd=0;
+    ingeek_DK_SessionG session_message_g = ingeek_DK_SessionG_init_zero;
+
+    switch(paramID)
+    {
+        case DKSERVER_CHAR_INFO:
+#ifdef DATA_PASSTHROUGH
+            info_send_t info_send;
+            info_send.head = 0x7E;
+            info_send.addr = 0x01;
+            info_send.opcode = 0x0210;
+            info_send.uuid = 0xF2FF;
+            info_send.length = (uint8_t)returnBytes;
+            //uart_send.data = newValue;
+            memcpy(info_send.data, newValue, returnBytes);
+            info_send.fcs= 0xFFFF;
+            SDITask_sendToUART(&info_send, sizeof(info_send));
+/*
+            typedef struct
+            {
+                uint8_t head;
+                uint8_t addr;
+                uint16_t opcode;
+                uint16_t uuid;
+                uint8_t length;
+                uint8_t *data;
+                uint16_t fcs;
+            }__attribute__((packed)) data_send_t;
+
+            data_send_t *pMsg;
+            if (pMsg = ICall_malloc(sizeof(data_send_t))){
+                pMsg->head = 0x7E;
+                pMsg->addr = 0x01;
+                pMsg->opcode = 0x0210;
+                pMsg->uuid = 0xF2FF;
+                pMsg->length = (uint8_t)returnBytes;
+                pMsg->data = newValue;
+                pMsg->fcs = 0xFFFF;
+                SDITask_sendToUART(pMsg, returnBytes+9);
+                ICall_free(pMsg);
+            }
+*/
+#else
+
+            //UART_WriteTransport(newValue,returnBytes);
+            ret=Handle_write_Infochar(newValue,returnBytes);
+            //DEBUG(newValue);DEBUG_NEWLINE();
+            Characteristic_zeroize(paramID);/*clear info Chars*/
+            if(true == ifLOG){
+                DEBUG("inforet:"); DEBUG((uint8_t*)convInt32ToText((int)ret)); DEBUG_NEWLINE();
+            }
+
+            if(ret == SUCCESS){
+                statem.status=CARINFO_VALID;
+            }
+            else{
+                memset(statem.vin,0x00,sizeof(statem.vin));//clear vin
+                memset(statem.Keyinfo.CMPK,0x00,LENGTH_32);//clear CMPK
+                statem.status=CARINFO_INVALID;
+            }
+
+            if(ret == SUCCESS){/*set info data*/
+                info_t.flag=Handle_read_Infochar();
+            }
+            DigitalkeyService_SetParameter(DKSERVER_CHAR_STATUS,&(statem.status),sizeof(uint8_t));
+#endif
+
+            break;
+        case DKSERVER_CHAR_AUTH:
+#ifdef DATA_PASSTHROUGH
+            auth_send_t auth_send;
+            auth_send.head = 0x7E;
+            auth_send.addr = 0x01;
+            auth_send.opcode = 0x0210;
+            auth_send.uuid = 0xF3FF;
+            auth_send.length = (uint8_t)returnBytes;
+            memcpy(auth_send.data, newValue, returnBytes);
+            auth_send.fcs = 0xFFFF;
+            SDITask_sendToUART(&auth_send, sizeof(auth_send));
+            //statem.status = 0x05;
+            //DigitalkeyService_SetParameter(DKSERVER_CHAR_STATUS,&(statem.status),sizeof(uint8_t));
+#else
+            //UART_WriteTransport (newValue, returnBytes);
+            if(returnBytes == 1){
+                memcpy(Data_send ,info_t.info_data ,info_t.infolen);
+                shang = (info_t.infolen)/19;
+                yu = (info_t.infolen)%19;
+                Util_startClock(&periodicClock);
+            }else{
+                if(statem.ver_number == 1){
+                    ret=Handle_Character_Auth_G(newValue,returnBytes);
+                }
+                else{
+                    ret=Handle_Character_Auth_X(newValue,returnBytes);
+                    if(ret != SUCCESS){
+                        memset(statem.Keyinfo.SK, 0x00, LENGTH_16);//clear SK
+                    }
+                }
+
+                //DEBUG("ret:"); DEBUG((uint8_t*)convInt32ToText(ret)); DEBUG_NEWLINE();
+                Characteristic_zeroize(paramID);
+                if(ret == SUCCESS){
+                    statem.status=WRITE_AUTH;
+                    //DEBUG("success");DEBUG_NEWLINE();
+                }else{
+                    //DEBUG("faild");DEBUG_NEWLINE();
+                    statem.status=CARINFO_VALID;
+                }
+                DigitalkeyService_SetParameter(DKSERVER_CHAR_STATUS,&(statem.status),sizeof(uint8_t));
+                DEBUG("AT+AUTH\r\n");
+            }
+#endif
+            break;
+        case DKSERVER_CHAR_SESSION:
+#ifdef DATA_PASSTHROUGH
+            session_send_t session_send;
+            session_send.head = 0x7E;
+            session_send.addr = 0x01;
+            session_send.opcode = 0x0210;
+            session_send.uuid = 0xF4FF;
+            session_send.length = (uint8_t)returnBytes;
+            memcpy(session_send.data, newValue, returnBytes);
+            session_send.fcs = 0xFFFF;
+            SDITask_sendToUART(&session_send, sizeof(session_send));
+#else
+            if(true == ifLOG){
+                //DEBUG("SESSION3");DEBUG_NEWLINE();
+            }
+            if(statem.ver_number == 0){
+                ret=Handle_Character_Session_X(newValue,returnBytes);
+                if(ret == SUCCESS){
+                    statem.status=WRITE_SESSION;
+                    //DEBUG("AUTH\r\n");
+                }else{
+                    statem.status=CARINFO_VALID;
+                    memset(statem.Keyinfo.SK, 0x00, LENGTH_16);//clear SK
+                    memset(statem.Keyinfo.SSC, 0x00, LENGTH_16);//clear SSC
+                }
+
+                DigitalkeyService_SetParameter(DKSERVER_CHAR_STATUS,&(statem.status),sizeof(uint8_t));
+                //DEBUG("sessionret4:"); DEBUG((uint8_t*)convInt32ToText((int)ret)); DEBUG_NEWLINE();
+                Characteristic_zeroize(paramID);
+            }
+            else if(statem.ver_number ==1){
+                ret=Handle_Character_Session_G(&session_message_g,newValue,returnBytes);
+                if(ret == SUCCESS){
+                    statem.status=WRITE_SESSION;
+                    //DEBUG("AUTH\r\n");
+                }else{
+                    statem.status=CARINFO_VALID;
+                }
+                DigitalkeyService_SetParameter(DKSERVER_CHAR_STATUS,&(statem.status),sizeof(uint8_t));
+                if(true == ifLOG){
+                    //DEBUG("sessionret4:"); DEBUG((uint8_t*)convInt32ToText((int)ret)); DEBUG_NEWLINE();
+                }
+
+                if(statem.status == WRITE_SESSION){
+                    ret=Calculate_SK(session_message_g.KICC.bytes,session_message_g.KICC.size);
+                    if(ret == SUCCESS){
+                        ret=Send_data_SS(paramID,&session_message_g);
+                        if(true == ifLOG){
+                            //DEBUG("sessionret5:"); DEBUG((uint8_t*)convInt32ToText((int)ret)); DEBUG_NEWLINE();
+                        }
+                        DEBUG("AT+SESSIONKEY\r\n");
+                    }
+                    /*SSC:CRnd||TRnd*/
+                    memcpy(statem.Keyinfo.SSC,session_message_g.CRnD.bytes,LENGTH_8);
+                    memcpy(statem.Keyinfo.SSC+LENGTH_8,statem.auth_g.TRnd,LENGTH_8);
+                }
+
+                Characteristic_zeroize(paramID);
+            }
+#endif
+            break;
+        case DKSERVER_CHAR_CMD:
+#ifdef DATA_PASSTHROUGH
+            cmd_send_t cmd_send;
+            cmd_send.head = 0x7E;
+            cmd_send.addr = 0x01;
+            cmd_send.opcode = 0x0210;
+            cmd_send.uuid = 0xF5FF;
+            cmd_send.length = (uint8_t)returnBytes;
+            memcpy(cmd_send.data, newValue, returnBytes);
+            cmd_send.fcs = 0xFFFF;
+            SDITask_sendToUART(&cmd_send, sizeof(cmd_send));
+#else
+            ret=Handle_Character_Cmd(paramID,newValue,returnBytes,&cmd);
+            //DEBUG("command:"); DEBUG((uint8_t*)convInt32ToText((int)cmd)); DEBUG_NEWLINE();
+            //DEBUG("result:"); DEBUG((uint8_t*)convInt32ToText((int)ret)); DEBUG_NEWLINE();
+            if(cmd == 1){
+                DEBUG("AT+UNLOCK\r\n");
+                DoorState = false;
+                if(rssi > 77){
+                    AutoLOCK = false;
+                }else{
+                    AutoLOCK = true;
+                }
+            }else if(cmd == 2){
+                DEBUG("AT+LOCK\r\n");
+                DoorState = true;
+                if(rssi < 70){
+                    AutoUnlOCK = false;
+                }else{
+                    AutoUnlOCK = true;
+                }
+                AutoLOCK = false;
+            }else if(cmd == 3){
+                DEBUG("AT+TRUNK_OPEN\r\n");
+            }else if(cmd == 4){
+                DEBUG("AT+FIRE\r\n");
+            }else if(cmd == 5){
+                DEBUG("AT+LEFT_DOOR\r\n");
+            }else if(cmd == 6){
+                DEBUG("AT+RIGHT_DOOR\r\n");
+            }else if(cmd == 7){
+                DEBUG("AT+FIND_CAR\r\n");
+            }else if(cmd == 11){
+                DEBUG("AT+OPEN_SKYLIGHT\r\n");
+            }else if(cmd == 12){
+                DEBUG("AT+CLOSE_SKYLIGHT\r\n");
+            }else if(cmd == 13){
+                DEBUG("AT+OPEN_CARWINDOW\r\n");
+            }else if(cmd == 14){
+                DEBUG("AT+CLOSE_CARWINDOW\r\n");
+            }
+            }else if(cmd == 15){
+                            DEBUG("AT+OPEN_AERATION\r\n");
+                        }
+            }else if(cmd == 16){
+                            DEBUG(" AT+CLOSE_AERATION\r\n");
+                        }
+            }else if(cmd == 17){
+                            DEBUG("AT+BM_DOOR_OPEN_LF\r\n");
+                        }
+            }else if(cmd == 18){
+                            DEBUG("AT+BM_DOOR_ONE_LF\r\n");
+                        }
+            }else if(cmd == 19){
+                            DEBUG("AT+BM_DOOR_TWO_LF\r\n");
+                        }
+            }else if(cmd == 20){
+                            DEBUG("AT+BM_DOOR_THREE_LF\r\n");
+                        }
+            }else if(cmd == 21){
+                            DEBUG("AT+BM_DOOR_FOUR_LF\r\n");
+                        }
+            }else if(cmd == 22){
+                            DEBUG("AT+BM_DOOR_OPEN_RF\r\n");
+                        }
+            }else if(cmd == 23){
+                            DEBUG("AT+BM_DOOR_ONE_RF\r\n");
+                        }
+            }else if(cmd == 24){
+                            DEBUG("AT+BM_DOOR_TWO_RF\r\n");
+                        }
+            }else if(cmd == 25){
+                            DEBUG("AT+BM_DOOR_THREE_RF\r\n");
+                        }
+            }else if(cmd == 26){
+                            DEBUG("AT+BM_DOOR_FOUR_RF\r\n");
+                        }
+            }else if(cmd == 27){
+                            DEBUG("AT+BM_DOOR_OPEN_LFRF\r\n");
+                        }
+
+            ret=Send_cmd_result(cmd,ret,paramID);/*send back to client*/
+            if(true == ifLOG){
+                DEBUG("Send_cmd_result:"); DEBUG((uint8_t*)convInt32ToText((int)ret)); DEBUG_NEWLINE();
+            }
+
+            if(ret != SUCCESS){
+                statem.status=CARINFO_VALID;
+                DigitalkeyService_SetParameter(DKSERVER_CHAR_STATUS,&(statem.status),sizeof(uint8_t));
+                memset(statem.Keyinfo.SK, 0x00, LENGTH_16);//clear SK
+                memset(statem.Keyinfo.SSC, 0x00, LENGTH_16);//clear SSC
+            }
+#endif
+            break;
+        case DKSERVER_CHAR_RSSI:
+            //int rssi = 0 - (int)(newValue[0]);
+            uint8_t qian_num = newValue[0];
+            uint8_t hou_num = newValue[1];
+            uint8_t zuo_num = newValue[2];
+            uint8_t you_num = newValue[3];
+            //uint8_t total = qian_num+hou_num+zuo_num+you_num;
+            //DEBUG("returnBytes:"); DEBUG((uint8_t*)convInt32ToText((int)returnBytes)); DEBUG_NEWLINE();
+            //if(total == (returnBytes-4) ){
+                //qian_rssi = meansDoRssi(newValue+4, qian_num);
+                //DEBUG("qian_num:"); DEBUG((uint8_t*)convInt32ToText((int)qian_num)); //DEBUG_NEWLINE();
+                //hou_rssi = meansDoRssi(newValue+4+qian_num, hou_num);
+                //DEBUG("hou_num:"); DEBUG((uint8_t*)convInt32ToText((int)hou_num)); //DEBUG_NEWLINE();
+                //zuo_rssi = meansDoRssi(newValue+4+qian_num+hou_num, zuo_num);
+                //DEBUG("zuo_num:"); DEBUG((uint8_t*)convInt32ToText((int)zuo_num)); //DEBUG_NEWLINE();
+                //you_rssi = meansDoRssi(newValue+4+qian_num+hou_num+zuo_num, you_num);
+                //DEBUG("you_num:"); DEBUG((uint8_t*)convInt32ToText((int)you_num)); DEBUG_NEWLINE();
+            //}
+            //DEBUG(newValue);
+            //DEBUG("rssi:");DEBUG((uint8_t*)convInt32ToText(rssi)); DEBUG("\r\n");
+            break;
+        case DKSERVER_CHAR_VERSION:
+             ret=Handle_Character_Ver(paramID, newValue,returnBytes);
+             Characteristic_zeroize(paramID);
+             //DEBUG("version ret:"); DEBUG((uint8_t*)convInt32ToText((int)ret)); DEBUG_NEWLINE();
+             break;
+        default:
+          /* should not reach here!*/
+          break;
+  }
+}
+
+/*********************************************************************
+*********************************************************************/
